@@ -76,10 +76,13 @@
          replay/1,
          verify/1,
          any/0,
-	 nothing/2]).
+         zelf/0,
+	 nothing/2,
+         lock/2]).
 
 %% gen_fsm callbacks ---
 -export([programming/3,
+         replaying/2,
          replaying/3,
          no_expectations/3,
          terminate/3,
@@ -91,6 +94,10 @@
 
 %% !!!NEVER CALL THIS FUNCTION!!! ---
 -export([invoke/4]).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% next invokation must happen in this time, orelse ... BOOM!!!111oneoneeleventy
+-define(INVOKATION_TIMEOUT, 4020).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% important types
@@ -135,7 +142,7 @@
 -spec new() ->
                  pid().
 new() ->
-    {ok, Pid} = gen_fsm:start_link(?MODULE, [], []),
+    {ok, Pid} = gen_fsm:start_link(?MODULE, [erlang:self()], []),
     Pid.
 
 %%------------------------------------------------------------------------------
@@ -250,6 +257,17 @@ nothing(M, Mod) when is_pid(M), is_atom(Mod) ->
 
 %%------------------------------------------------------------------------------
 %% @doc
+%% The function will block until all modules in the list are not
+%% mocked by another erlymock process.
+%% @end
+%%------------------------------------------------------------------------------
+-spec lock(pid(), [atom()]) ->
+		     ok.
+lock(M, Mods) when is_pid(M), is_list(Mods) ->
+   ok = em_module_locker:lock(M, Mods).
+
+%%------------------------------------------------------------------------------
+%% @doc
 %% Finishes the programming phase and switches to the replay phase where the 
 %% actual code under test may run and invoke the functions mocked. This may
 %% be called only once, and only in the programming phase. This also loads 
@@ -288,6 +306,18 @@ any() ->
             true
     end.
 
+%%------------------------------------------------------------------------------
+%% @doc
+%% Utility function that can be used as a match function in an
+%% argument list to match self(), e.g. when it matches the pid of the
+%% process, that calls the funtion during the replay phase.
+%% @end
+%%------------------------------------------------------------------------------
+-spec zelf() -> 
+                  atom().
+zelf() -> 
+    '$$em zelf$$'.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% internal state
 %%
@@ -299,6 +329,8 @@ any() ->
          answer :: answer()}).
 
 -record(state, {
+          test_proc :: pid(),
+          inv_to_ref :: reference(),
           strict :: [#expectation{}],
           stub  :: [#expectation{}],
 	  blacklist :: [atom()],
@@ -312,10 +344,11 @@ any() ->
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-init([]) ->
+init([TestProc]) ->
     {ok,
      programming,
      #state{
+       test_proc = TestProc,
        strict = [],
        stub = [],
        blacklist = [],
@@ -356,6 +389,7 @@ programming(replay,
             _From,
             State = #state{strict = Strict}) ->
     MMs = install_mock_modules(State),
+    InvTORef = gen_fsm:start_timer(?INVOKATION_TIMEOUT, invokation_timeout),
     {reply,
      ok,
      case Strict of
@@ -363,15 +397,22 @@ programming(replay,
          _ -> replaying
      end,
      State#state{
+       inv_to_ref = InvTORef,
        strict = lists:reverse(Strict),
        mocked_modules = MMs}}.
 
 %%------------------------------------------------------------------------------
 %% @private (goto-char 1)
 %%------------------------------------------------------------------------------
-replaying(I = {invokation, Mod, Fun, Args},
+replaying({timeout, Ref, invokation_timeout},
+          State = #state{inv_to_ref = Ref,
+                         strict = Expectations}) ->
+    {stop,{invokation_timeout, {missing_invokations, Expectations}},State}.
+
+replaying(I = {invokation, Mod, Fun, Args, IPid},
           _From,
           State = #state{
+            inv_to_ref = InvTORef,
             strict = [#expectation{
                         m      = Mod,
                         f      = Fun,
@@ -379,15 +420,19 @@ replaying(I = {invokation, Mod, Fun, Args},
                         answer = Answer}
                       |Rest]})
   when length(EArgs) == length(Args) ->
-    case check_args(Args, EArgs) of
+    gen_fsm:cancel_timer(InvTORef),
+    case check_args(Args, EArgs, IPid) of
         true ->
             {reply,
              Answer,
              case Rest of
                  [] -> no_expectations;
-                 _ -> replaying
+                 _ ->                     
+                     replaying
              end,
-             State#state{strict=Rest}};
+             State#state{
+               inv_to_ref = gen_fsm:start_timer(?INVOKATION_TIMEOUT, invokation_timeout),
+               strict=Rest}};
         {error, Index, Expected, Actual} ->
             Reason = {unexpected_function_parameter,
                       {error_in_parameter, Index},
@@ -397,13 +442,18 @@ replaying(I = {invokation, Mod, Fun, Args},
             {stop, Reason, Reason, State}
     end;
 
-replaying(I = {invokation, _M, _F, _A},
+replaying(I = {invokation, _M, _F, _A, _IPid},
           _From,
           State = #state{
+            inv_to_ref = InvTORef,
 	    strict = [E|_]}) ->
+    gen_fsm:cancel_timer(InvTORef),
     case handle_stub_invokation(I, State#state.stub) of
 	{ok, Answer} ->
-	    {reply, Answer, replaying, State};
+	    {reply, Answer, replaying, 
+             State#state{
+               inv_to_ref = gen_fsm:start_timer(?INVOKATION_TIMEOUT, invokation_timeout)
+              }};
 	
 	error ->
 	    Reason = {unexpected_invokation, {actual, I}, {expected, E}},
@@ -412,14 +462,16 @@ replaying(I = {invokation, _M, _F, _A},
 
 replaying(verify,
           _From,
-          State) ->
+          State = #state{inv_to_ref = InvTORef}) ->
+    gen_fsm:cancel_timer(InvTORef),
     Reason = {invokations_missing, State#state.strict},
     {stop, Reason, Reason, State}.
 
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-no_expectations(I = {invokation, _M, _F, _A}, _From, State) ->
+no_expectations(I = {invokation, _M, _F, _A, _IPid}, _From, State = #state{inv_to_ref = InvTORef}) ->
+    gen_fsm:cancel_timer(InvTORef),
     case handle_stub_invokation(I, State#state.stub) of
         {ok, Answer} ->
             {reply, Answer, no_expectations, State};
@@ -437,8 +489,9 @@ no_expectations(verify,
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-terminate(_Reason, _StateName, State) ->
-    unload_mock_modules(State).
+terminate(Reason, _StateName, State = #state{test_proc = TestProc}) ->
+    unload_mock_modules(State),
+    exit(TestProc, Reason).
 
 %%------------------------------------------------------------------------------
 %% @private
@@ -472,7 +525,7 @@ handle_event(_Msg, _StateName, State) ->
 %% @private
 %%------------------------------------------------------------------------------
 invoke(M, Mod, Fun, Args) ->
-    case gen_fsm:sync_send_event(M, {invokation, Mod, Fun, Args}) of
+    case gen_fsm:sync_send_event(M, {invokation, Mod, Fun, Args, self()}) of
         {return, Value} ->
             Value;
         {function, F} ->
@@ -487,6 +540,7 @@ invoke(M, Mod, Fun, Args) ->
 %%------------------------------------------------------------------------------
 unload_mock_modules(#state{mocked_modules = MMs}) ->
     [begin
+   code:purge(Mod),
 	 code:delete(Mod),
 	 code:purge(Mod),
          case MaybeBin of
@@ -506,6 +560,7 @@ install_mock_modules(#state{strict = ExpectationsStrict,
 			    blacklist = BlackList}) ->
     Expectations = ExpectationsStub ++ ExpectationsStrict,
     ModulesToMock = lists:usort([M || #expectation{m = M} <- Expectations] ++ BlackList),
+    em_module_locker:lock(erlang:self(), ModulesToMock),
     [install_mock_module(M, Expectations) || M <- ModulesToMock].
 
 %%------------------------------------------------------------------------------
@@ -527,6 +582,7 @@ install_mock_module(Mod, Expectations) ->
         compile:forms([erl_syntax:revert(F)
                        || F <- ModHeaderSyn ++ FunFormsSyn]),
 
+    code:purge(Mod),
     code:delete(Mod),
     code:purge(Mod),
     {module, _} = load_module(Mod, Code),
@@ -556,7 +612,7 @@ var_list_syn(Args) ->
 %% @private
 %%------------------------------------------------------------------------------
 body_syn(Mod, FunSyn, ArgsSyn) ->
-    SelfStr = pid_to_list(self()),
+    SelfStr = pid_to_list(erlang:self()),
     SelfSyn = erl_syntax:application(
                 erl_syntax:atom(erlang),
                 erl_syntax:atom(list_to_pid),
@@ -572,7 +628,7 @@ body_syn(Mod, FunSyn, ArgsSyn) ->
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-check_args(Args, ArgSpecs) ->
+check_args(Args, ArgSpecs, InvokationPid) ->
     try
         [begin
              if
@@ -582,13 +638,23 @@ check_args(Args, ArgSpecs) ->
                              ok;
                          _ ->
                              throw({error, I, E, A})
-                     end;
-
-                 A =/= E ->
-                     throw({error, I, E, A});
-
-                 A == E ->
-                     ok
+                     end;                  
+                 true ->
+                     case E of
+                         
+                         '$$em zelf$$' -> 
+                             if A =/= InvokationPid -> 
+                                     throw({error, I, E, A});
+                                true ->
+                                     ok
+                             end;
+                         
+                         A ->
+                             ok;
+                         
+                         _Otherwise ->
+                             throw({error, I, E, A})
+                     end
              end
          end
          || {I, A, E} <- lists:zip3(lists:seq(1, length(Args)),
@@ -604,11 +670,11 @@ check_args(Args, ArgSpecs) ->
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-handle_stub_invokation({invokation, Mod, Fun, Args}, Stubs) ->
+handle_stub_invokation({invokation, Mod, Fun, Args, IPid}, Stubs) ->
     case [MatchingStub
           || MatchingStub = #expectation {m = M, f = F, a = A} <- Stubs,
              M == Mod, F == Fun, length(Args) == length(A),
-             check_args(Args, A) == true] of
+             check_args(Args, A, IPid) == true] of
 
         [#expectation{answer = Answer}|_] ->
             {ok, Answer};
